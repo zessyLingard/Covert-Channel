@@ -1,6 +1,5 @@
 import pandas as pd
 import numpy as np
-import math
 import gzip
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, auc
@@ -9,217 +8,166 @@ from sklearn.metrics import roc_curve, auc
 # CONFIGURATION
 # ============================================================
 LEGIT_FILE = "data/http.csv"
-COVERT_FILE = "data/no_vpn_fuzz.csv"
-WINDOW_SIZE = 500
-EPSILONS = [0.005, 0.008, 0.01, 0.02, 0.03, 0.1]
-EPSILON_TO_PLOT = 0.01  # epsilon used for the ROC subplots
+COVERT_FILE = "data/no_vpn_fuzzy.csv"
+
+TARGET_PACKET_COUNT = 51000
+WINDOW_SIZE = 510
+EPSILON_TO_PLOT = 0.005
 
 # ============================================================
-# DETECTION METHOD 1: Original ε-Similarity
+# HELPER: DISJOINT CHUNKER (No Stride, Just Reshape)
 # ============================================================
-def eps_similarity(window, epsilons=EPSILONS):
-    """Calculate ε-similarity scores for a window of IATs."""
-    if len(window) < 2:
-        return {e: 0.0 for e in epsilons}
-    sorted_w = window.sort_values(ignore_index=True)
-    diffs = np.abs(sorted_w.diff().iloc[1:])
-    ratios = diffs / (sorted_w.iloc[:-1].values + 1e-9)
-    return {e: float(np.sum(ratios < e) / len(ratios)) for e in epsilons}
+def get_disjoint_windows(data, window_size):
+    """
+    Splits data into clean, non-overlapping chunks.
+    Drops any 'remainder' packets at the end to ensure perfect shapes.
+    """
+    # 1. Calculate how many full windows fit
+    num_windows = len(data) // window_size
+    
+    # 2. Cut the data to the exact length needed
+    cutoff = num_windows * window_size
+    clean_data = data[:cutoff]
+    
+    # 3. Reshape into (Num_Windows, Window_Size)
+    # This effectively removes "stride" by making it implicit (Stride = Size)
+    return clean_data.reshape(num_windows, window_size)
 
 # ============================================================
-# DETECTION METHOD 2: Enhanced ε-Similarity (top 1/3)
+# 1. ORIGINAL ε-SIMILARITY
 # ============================================================
-def enhanced_eps_similarity(window, epsilons=EPSILONS):
-    """Calculate enhanced ε-similarity using only the top 1/3 of sorted values."""
-    if len(window) < 3:
-        return {e: 0.0 for e in epsilons}
-    sorted_w = window.sort_values(ignore_index=True)
-    top_third = sorted_w[math.floor(len(sorted_w) * (2 / 3)):]
-    return eps_similarity(top_third, epsilons)
+def calc_eps_similarity(window, epsilon=0.01):
+    if len(window) < 2: return 0.0
+    sorted_w = np.sort(window)
+    diffs = np.diff(sorted_w)
+    denominators = sorted_w[1:] + 1e-12
+    ratios = diffs / denominators
+    score = np.sum(ratios < epsilon) / len(ratios)
+    return score
 
 # ============================================================
-# DETECTION METHOD 3: Compressibility
+# 2. ENHANCED ε-SIMILARITY (The Remedy)
 # ============================================================
-def iat2str(i):
-    """Convert an IAT value to a compact string representation."""
-    if i == 0:
-        return '0'
+def calc_enhanced_eps_similarity(window, epsilon=0.01):
+    # 1. Sort ENTIRE window
+    sorted_w = np.sort(window)
+
+    # 2. Split (Top 33%)
+    # For 510 size, this takes the last 170 packets
+    third_idx = (len(sorted_w) * 2) // 3
+    sub_window_3 = sorted_w[third_idx:]
+
+    # 3. Calculate Score on Sub-window
+    if len(sub_window_3) < 2: return 0.0
+    diffs = np.diff(sub_window_3)
+    denominators = sub_window_3[1:] + 1e-12
+    ratios = diffs / denominators
+    score = np.sum(ratios < epsilon) / len(ratios)
+    return score
+
+# ============================================================
+# 3. COMPRESSIBILITY SCORE
+# ============================================================
+def calc_compressibility(window):
+    # Convert to string (5 decimals)
+    raw_bytes = " ".join([f"{x:.5f}" for x in window]).encode('utf-8')
+    compressed_bytes = gzip.compress(raw_bytes)
+
+    # Return raw ratio. We will negate it later for ROC.
+    return len(compressed_bytes) / len(raw_bytes)
+
+# ============================================================
+# MAIN EXECUTION
+# ============================================================
+def run_evaluation():
+    print("Loading data...")
     try:
-        i = round(i, 2 - int(math.floor(math.log10(abs(i)))) - 1)
-    except ValueError:
-        return ""
-    s = '{:.16f}'.format(i).split('.')[1]
-    leading_zeros = len(s) - len(s.lstrip('0'))
-    if leading_zeros == 0:
-        return s.strip('0')
-    else:
-        return chr(64 + leading_zeros) + s.strip('0')
+        legit_full = pd.read_csv(LEGIT_FILE, encoding='utf-8')['IPDs'].dropna().values
+    except (KeyError, ValueError):
+        # Fallback if no header
+        legit_full = pd.read_csv(LEGIT_FILE, header=None).values.flatten()
 
+    try:
+        covert_full = pd.read_csv(COVERT_FILE)['IPDs'].dropna().values
+    except (KeyError, ValueError):
+        covert_full = pd.read_csv(COVERT_FILE, header=None).values.flatten()
 
-def compressibility(window):
-    """Calculate compression ratio (original / compressed) for a window."""
-    full_string = window.apply(iat2str).str.cat()
-    if not full_string:
-        return np.nan
-    original_size = len(full_string.encode())
-    compressed_size = len(gzip.compress(full_string.encode()))
-    if compressed_size == 0:
-        return np.nan
-    return original_size / compressed_size
+    # ---- STRICT DATA TRUNCATION ----
+    print(f"Raw Legit Size: {len(legit_full)}")
+    print(f"Raw Covert Size: {len(covert_full)}")
 
-# ============================================================
-# PROCESSING HELPERS
-# ============================================================
-def process_eps_windows(iat_series, detection_fn, label):
-    """Run an ε-based detector over all windows, return dict of score lists per epsilon."""
-    scores_by_eps = {e: [] for e in EPSILONS}
-    num_windows = len(iat_series) // WINDOW_SIZE
-    for i in range(num_windows):
-        window = iat_series.iloc[i * WINDOW_SIZE: (i + 1) * WINDOW_SIZE]
-        score_dict = detection_fn(window)
-        for e in EPSILONS:
-            scores_by_eps[e].append(score_dict[e])
-    print(f"  [{label}] {num_windows} windows processed")
-    return scores_by_eps
+    # Force cut to TARGET_PACKET_COUNT (51,000)
+    # If one file is smaller, we limit to the smaller size to be fair
+    limit = min(TARGET_PACKET_COUNT, len(legit_full), len(covert_full))
+    print(f"TRUNCATING DATA TO: {limit} packets.")
 
+    legit_df = legit_full[:limit]
+    covert_df = covert_full[:limit]
 
-def process_compress_windows(iat_series, label):
-    """Run compressibility detector over all windows, return array of scores."""
-    scores = (
-        iat_series
-        .groupby(np.arange(len(iat_series)) // WINDOW_SIZE)
-        .apply(compressibility)
-        .dropna()
-    )
-    print(f"  [{label}] {len(scores)} windows processed")
-    return scores.to_numpy()
+    # ---- GENERATE CLEAN WINDOWS ----
+    legit_windows = get_disjoint_windows(legit_df, WINDOW_SIZE)
+    covert_windows = get_disjoint_windows(covert_df, WINDOW_SIZE)
 
+    print(f"Legit Samples: {len(legit_windows)}")
+    print(f"Covert Samples: {len(covert_windows)}")
 
-def compute_roc(legit_scores, covert_scores):
-    """Compute ROC curve and AUC from legit/covert score arrays."""
-    all_scores = np.concatenate([legit_scores, covert_scores])
-    labels = np.concatenate([np.zeros(len(legit_scores)), np.ones(len(covert_scores))])
-    if len(np.unique(labels)) < 2:
-        return np.nan, None, None
-    fpr, tpr, _ = roc_curve(labels, all_scores)
-    return auc(fpr, tpr), fpr, tpr
+    # ---- CALCULATE SCORES ----
+    print("Calculating scores...")
 
-# ============================================================
-# MAIN
-# ============================================================
+    # Labels: 0 = Legit, 1 = Covert
+    y_true = [0] * len(legit_windows) + [1] * len(covert_windows)
+
+    # 1. Original Epsilon
+    scores_legit_eps = [calc_eps_similarity(w, EPSILON_TO_PLOT) for w in legit_windows]
+    scores_covert_eps = [calc_eps_similarity(w, EPSILON_TO_PLOT) for w in covert_windows]
+    y_scores_eps = scores_legit_eps + scores_covert_eps
+
+    # 2. Enhanced Epsilon
+    scores_legit_enh = [calc_enhanced_eps_similarity(w, EPSILON_TO_PLOT) for w in legit_windows]
+    scores_covert_enh = [calc_enhanced_eps_similarity(w, EPSILON_TO_PLOT) for w in covert_windows]
+    y_scores_enh = scores_legit_enh + scores_covert_enh
+
+    # 3. Compressibility (Negated Ratio)
+    scores_legit_comp = [calc_compressibility(w) for w in legit_windows]
+    scores_covert_comp = [calc_compressibility(w) for w in covert_windows]
+    y_scores_comp = [-s for s in scores_legit_comp] + [-s for s in scores_covert_comp]
+
+    # ---- PLOTTING ----
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+    # Plot 1
+    fpr, tpr, _ = roc_curve(y_true, y_scores_eps)
+    roc_auc = auc(fpr, tpr)
+    axes[0].plot(fpr, tpr, color='blue', lw=2, label=f'AUC = {roc_auc:.2f}')
+    axes[0].plot([0, 1], [0, 1], 'r--')
+    axes[0].set_title(f'Original ε-Similarity (ε={EPSILON_TO_PLOT})')
+    axes[0].set_xlabel('False Positive Rate')
+    axes[0].set_ylabel('True Positive Rate')
+    axes[0].legend(loc="lower right")
+
+    # Plot 2
+    fpr, tpr, _ = roc_curve(y_true, y_scores_enh)
+    roc_auc = auc(fpr, tpr)
+    axes[1].plot(fpr, tpr, color='green', lw=2, label=f'AUC = {roc_auc:.2f}')
+    axes[1].plot([0, 1], [0, 1], 'r--')
+    axes[1].set_title(f'Enhanced ε-Similarity (ε={EPSILON_TO_PLOT})')
+    axes[1].set_xlabel('False Positive Rate')
+    axes[1].set_ylabel('True Positive Rate')
+    axes[1].legend(loc="lower right")
+
+    # Plot 3
+    fpr, tpr, _ = roc_curve(y_true, y_scores_comp)
+    roc_auc = auc(fpr, tpr)
+    axes[2].plot(fpr, tpr, color='orange', lw=2, label=f'AUC = {roc_auc:.2f}')
+    axes[2].plot([0, 1], [0, 1], 'r--')
+    axes[2].set_title('Compressibility (Negated)')
+    axes[2].set_xlabel('False Positive Rate')
+    axes[2].set_ylabel('True Positive Rate')
+    axes[2].legend(loc="lower right")
+
+    plt.tight_layout()
+    plt.savefig("experiment_results_clean.png")
+    print("Done! Saved plot to experiment_results_clean.png")
+
 if __name__ == "__main__":
-    print("=" * 60)
-    print("  Unified Covert Channel Detection — ROC AUC Analysis")
-    print("=" * 60)
-
-    # --- Load data ---
-    def load_csv(path):
-        """Try UTF-8 first, fall back to UTF-16."""
-        try:
-            return pd.read_csv(path)
-        except Exception:
-            return pd.read_csv(path, encoding='utf-16')
-
-    print(f"\nLoading legitimate traffic from '{LEGIT_FILE}'...")
-    legit_iat = pd.to_numeric(load_csv(LEGIT_FILE).iloc[:, 0], errors='coerce').dropna()
-    print(f"  → {len(legit_iat):,} IATs loaded")
-
-    print(f"Loading covert traffic from '{COVERT_FILE}'...")
-    covert_iat = pd.to_numeric(load_csv(COVERT_FILE).iloc[:, 0], errors='coerce').dropna()
-    print(f"  → {len(covert_iat):,} IATs loaded")
-
-    # --- Method 1: Original ε-similarity ---
-    print(f"\n--- Method 1: Original ε-Similarity (window={WINDOW_SIZE}) ---")
-    legit_eps_orig = process_eps_windows(legit_iat, eps_similarity, "Legit")
-    covert_eps_orig = process_eps_windows(covert_iat, eps_similarity, "Covert")
-
-    # --- Method 2: Enhanced ε-similarity ---
-    print(f"\n--- Method 2: Enhanced ε-Similarity (top 1/3, window={WINDOW_SIZE}) ---")
-    legit_eps_enh = process_eps_windows(legit_iat, enhanced_eps_similarity, "Legit")
-    covert_eps_enh = process_eps_windows(covert_iat, enhanced_eps_similarity, "Covert")
-
-    # --- Method 3: Compressibility ---
-    print(f"\n--- Method 3: Compressibility (window={WINDOW_SIZE}) ---")
-    legit_comp = process_compress_windows(legit_iat, "Legit")
-    covert_comp = process_compress_windows(covert_iat, "Covert")
-
-    # ========================================================
-    # RESULTS TABLE
-    # ========================================================
-    print("\n" + "=" * 60)
-    print("  RESULTS")
-    print("=" * 60)
-
-    # ε-similarity results for each epsilon
-    eps_results_orig = {}
-    eps_results_enh = {}
-    print(f"\n{'Method':<28} {'ε':<10} {'AUC':<10}")
-    print("-" * 50)
-    for e in EPSILONS:
-        auc_o, fpr_o, tpr_o = compute_roc(
-            np.array(legit_eps_orig[e]), np.array(covert_eps_orig[e])
-        )
-        eps_results_orig[e] = (auc_o, fpr_o, tpr_o)
-
-        auc_e, fpr_e, tpr_e = compute_roc(
-            np.array(legit_eps_enh[e]), np.array(covert_eps_enh[e])
-        )
-        eps_results_enh[e] = (auc_e, fpr_e, tpr_e)
-
-        print(f"{'Original ε-sim':<28} {e:<10} {auc_o:.4f}")
-        print(f"{'Enhanced ε-sim (top 1/3)':<28} {e:<10} {auc_e:.4f}")
-
-    auc_c, fpr_c, tpr_c = compute_roc(legit_comp, covert_comp)
-    print(f"\n{'Compressibility':<28} {'—':<10} {auc_c:.4f}")
-
-    # ========================================================
-    # PLOTTING — 3 subplots
-    # ========================================================
-    print("\nGenerating combined ROC plot...")
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-
-    # (a) Original ε-similarity
-    ax = axes[0]
-    auc_o, fpr_o, tpr_o = eps_results_orig[EPSILON_TO_PLOT]
-    if fpr_o is not None:
-        ax.plot(fpr_o, tpr_o, color='blue', lw=2, label=f'Covert (AUC={auc_o:.2f})')
-    ax.plot([0, 1], [0, 1], 'r--', lw=1.5, label='Random')
-    ax.set_title(f'(a) Original ε-Similarity (ε={EPSILON_TO_PLOT})')
-    ax.set_xlabel('False Positive Rate')
-    ax.set_ylabel('True Positive Rate')
-    ax.legend(loc='lower right')
-    ax.grid(True, alpha=0.3)
-
-    # (b) Enhanced ε-similarity
-    ax = axes[1]
-    auc_e, fpr_e, tpr_e = eps_results_enh[EPSILON_TO_PLOT]
-    if fpr_e is not None:
-        ax.plot(fpr_e, tpr_e, color='green', lw=2, label=f'Covert (AUC={auc_e:.2f})')
-    ax.plot([0, 1], [0, 1], 'r--', lw=1.5, label='Random')
-    ax.set_title(f'(b) Enhanced ε-Similarity (ε={EPSILON_TO_PLOT})')
-    ax.set_xlabel('False Positive Rate')
-    ax.set_ylabel('True Positive Rate')
-    ax.legend(loc='lower right')
-    ax.grid(True, alpha=0.3)
-
-    # (c) Compressibility
-    ax = axes[2]
-    if fpr_c is not None:
-        ax.plot(fpr_c, tpr_c, color='orange', lw=2, label=f'Covert (AUC={auc_c:.2f})')
-    ax.plot([0, 1], [0, 1], 'r--', lw=1.5, label='Random')
-    ax.set_title('(c) Compressibility')
-    ax.set_xlabel('False Positive Rate')
-    ax.set_ylabel('True Positive Rate')
-    ax.legend(loc='lower right')
-    ax.grid(True, alpha=0.3)
-
-    plt.suptitle(
-        f'Covert Channel Detectability — {LEGIT_FILE} vs {COVERT_FILE}',
-        fontsize=14, fontweight='bold'
-    )
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
-    plt.savefig("roc_all_methods.png", dpi=300, bbox_inches='tight')
-    print("Plot saved as 'roc_all_methods.png'")
-    plt.show()
-
-    print("\nDone.")
+    run_evaluation()

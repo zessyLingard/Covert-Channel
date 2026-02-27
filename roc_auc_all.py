@@ -1,12 +1,12 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from sklearn.metrics import roc_curve, auc
+from sklearn.metrics import RocCurveDisplay
 
 # --- Configuration ---
-LEGIT_FILE = "data/legit_traffic_seconds.csv"
-COVERT_FILE = "data/fuzzy_o.csv"
-WINDOW_SIZE = 2000
+LEGIT_FILE = "data/past_data/legit_traffic_seconds.csv"
+COVERT_FILE = "data/no_vpn_fuzzy.csv"
+WINDOW_SIZE = 510
 EPSILONS = [0.005, 0.008, 0.01, 0.02, 0.03, 0.1]
 
 # --- Analysis Functions ---
@@ -23,18 +23,17 @@ def process_traffic_file(iat_series):
             scores_by_eps[e].append(np.sum(ratios < e) / len(ratios))
     return scores_by_eps
 
-def get_auc(legit_scores, covert_scores, epsilon):
-    """Calculate AUC for a specific epsilon"""
+def get_labels_scores(legit_scores, covert_scores, epsilon):
+    """Get labels and scores for a specific epsilon"""
     l = np.array(legit_scores[epsilon])
     c = np.array(covert_scores[epsilon])
     if len(l) == 0 or len(c) == 0:
-        return np.nan, None, None
+        return None, None
     y = np.concatenate([np.zeros(len(l)), np.ones(len(c))])
     scores = np.concatenate([l, c])
     if len(np.unique(y)) < 2:
-        return np.nan, None, None
-    fpr, tpr, _ = roc_curve(y, scores)
-    return auc(fpr, tpr), fpr, tpr
+        return None, None
+    return y, scores
 
 # --- Main Logic ---
 if __name__ == "__main__":
@@ -43,20 +42,21 @@ if __name__ == "__main__":
     print("="*60)
     
     # Load data
-    print(f"\nLoading legitimate traffic from '{LEGIT_FILE}'...")
-    try:
-        legit_iat = pd.to_numeric(pd.read_csv(LEGIT_FILE, encoding='utf-16').iloc[:,0], errors='coerce').dropna()
-        print(f"  → {len(legit_iat):,} inter-arrival times loaded")
-    except Exception as e:
-        print(f"Error loading legit data: {e}")
-        exit()
-    
     print(f"\nLoading covert traffic from '{COVERT_FILE}'...")
     try:
         covert_iat = pd.to_numeric(pd.read_csv(COVERT_FILE).iloc[:,0], errors='coerce').dropna()
         print(f"  → {len(covert_iat):,} inter-arrival times loaded")
     except Exception as e:
         print(f"Error loading covert data: {e}")
+        exit()
+    
+    n_covert = len(covert_iat)
+    print(f"\nLoading legitimate traffic from '{LEGIT_FILE}' (limited to {n_covert:,} samples)...")
+    try:
+        legit_iat = pd.to_numeric(pd.read_csv(LEGIT_FILE, encoding='utf-16').iloc[:,0], errors='coerce').dropna().iloc[:n_covert].reset_index(drop=True)
+        print(f"  → {len(legit_iat):,} inter-arrival times loaded")
+    except Exception as e:
+        print(f"Error loading legit data: {e}")
         exit()
     
     # Process traffic
@@ -74,43 +74,32 @@ if __name__ == "__main__":
     print(f"{'eps':<10} {'AUC':<10} {'Interpretation'}")
     print("-"*60)
     
-    results = {}
-    for e in EPSILONS:
-        auc_val, fpr, tpr = get_auc(legit_scores, covert_scores, e)
-        results[e] = (auc_val, fpr, tpr)
-        
-        # Interpretation
-        if np.isnan(auc_val):
-            interp = "N/A"
-        elif auc_val >= 0.9:
-            interp = "Easily Detected! (Bad stealth)"
-        elif auc_val >= 0.7:
-            interp = "Somewhat Detectable"
-        elif auc_val >= 0.6:
-            interp = "Marginally Detectable"
-        elif auc_val >= 0.4:
-            interp = "Near Random (Good stealth)"
-        else:
-            interp = "Inverse Detection (Unusual)"
-        
-        print(f"{e:<10} {auc_val:.4f}     {interp}")
+    n = len(EPSILONS)
+    cols = min(3, n)
+    rows = (n + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(4.5 * cols, 4 * rows))
+    axes = np.array(axes).flatten()
     
-    # Plot ROC curves for all epsilons
-    print("\nGenerating ROC plot...")
-    fig, ax = plt.subplots(figsize=(10, 8))
-    
-    colors = plt.cm.viridis(np.linspace(0, 0.9, len(EPSILONS)))
     for i, e in enumerate(EPSILONS):
-        auc_val, fpr, tpr = results[e]
-        if fpr is not None and tpr is not None:
-            ax.plot(fpr, tpr, color=colors[i], lw=2, label=f'ε={e} (AUC={auc_val:.2f})')
+        ax = axes[i]
+        y, scores = get_labels_scores(legit_scores, covert_scores, e)
+        if y is not None:
+            display = RocCurveDisplay.from_predictions(y, scores, ax=ax,
+                                                       color='blue', lw=1.5, name=None)
+            auc_val = display.roc_auc
+            ax.plot([0, 1], [0, 1], 'r--', lw=1)
+            ax.legend([f'AUC = {auc_val:.2f}'], loc='lower right', fontsize=9,
+                      frameon=False)
+        ax.set_title(f'ε = {e}', fontsize=11)
+        ax.set_xlim([0, 1])
+        ax.set_ylim([0, 1])
+        ax.set_xlabel('False Positive Rate', fontsize=9)
+        ax.set_ylabel('True Positive Rate', fontsize=9)
+        ax.tick_params(labelsize=8)
     
-    ax.plot([0, 1], [0, 1], 'r--', lw=2, label='Random Classifier')
-    ax.set_xlabel('False Positive Rate', fontsize=12)
-    ax.set_ylabel('True Positive Rate', fontsize=12)
-    ax.set_title('ε-Similarity Detection: ROC Curves\n(http.csv vs fuzzy_o.csv)', fontsize=14)
-    ax.legend(loc='lower right')
-    ax.grid(True, alpha=0.3)
+    # Hide unused subplots
+    for j in range(n, len(axes)):
+        axes[j].set_visible(False)
     
     plt.tight_layout()
     plt.savefig("roc_auc_result.png", dpi=300, bbox_inches='tight')

@@ -5,7 +5,7 @@ import gzip
 import matplotlib.pyplot as plt
 
 np.random.seed(0)
-windowsize = 2000
+windowsize = 512
 
 def iat2str(i):
     if i == 0:
@@ -32,7 +32,7 @@ def compress(x):
         return np.nan
     return original_size / compressed_size
 
-input_filename = "data/no_vpn_no_fuzzy.csv"
+input_filename = "data/past_data/timings_1_fuzzed.csv"
 
 try:
     input_df = pd.read_csv(input_filename, header=None)
