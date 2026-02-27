@@ -12,8 +12,6 @@ build/
 *.o
 *.out
 
-# Generated images
-*.png
 
 # IDE
 .vscode/

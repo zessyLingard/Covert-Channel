@@ -6,8 +6,8 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, auc
 
 
-LEGIT_FILE = "data/legit_iat.csv"
-COVERT_FILE = "data/past_data/timings_2_fuzzed.csv"  
+LEGIT_FILE = "data/legit_traffic_seconds.csv"
+COVERT_FILE = "data/vpn_fuzzy_sing.csv"  
 WINDOW_SIZE = 512  
 
 np.random.seed(0)
@@ -55,7 +55,7 @@ def process_window(window):
     Nhận 1 cửa sổ 2000 packets -> Lọc IAT > 1.0s -> Nén
     """
     # Bước 2 của thuật toán: Bỏ tất cả các giá trị > 1.0 sec bên trong cửa sổ
-    valid_window = window[window <= 1.0]
+    valid_window = window[window <= 1.5]
     
     # Nếu sau khi lọc không còn data, bỏ qua
     if len(valid_window) == 0:

@@ -34,7 +34,7 @@ def main():
         iat_ms = [float(v) for v in f.read().replace('\n', ',').split(',') if v.strip()]
 
     fuzzed = [inject_fuzzy(x, tau_ms) for x in iat_ms]
-    print(','.join(f"{x:.3f}" for x in fuzzed))
+    print(','.join(f"{x:.9f}" for x in fuzzed))
 
 if __name__ == "__main__":
     main()

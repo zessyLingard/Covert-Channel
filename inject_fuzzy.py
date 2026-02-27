@@ -9,9 +9,8 @@ def inject_fuzzy(x, tau):
     thresh = (3 * tau) / 2
 
     if x < thresh:
-        # For small values: sample from truncated normal distribution
         res = np.abs(np.random.normal(0.0, scale=thresh / 7))
-        while res > thresh:  # Keep resampling until within threshold
+        while res > thresh:  
             res = np.abs(np.random.normal(0.0, scale=thresh / 7))
         return res
     else:

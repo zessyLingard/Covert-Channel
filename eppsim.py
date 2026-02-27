@@ -32,9 +32,9 @@ def improved_eps(x):
         res[e] = np.count_nonzero(lambdas < e) / lambdas.count()
     return res
 
-csv_filename = "data/legit_traffic_seconds.csv"
-input = pd.read_csv(csv_filename, encoding = "utf-16")
-iat = pd.to_numeric(input["IPDs"], errors='coerce').dropna() 
+csv_filename = "data/past_data/timings_7_fuzzed.csv"
+input = pd.read_csv(csv_filename)
+iat = pd.to_numeric(input["Time"], errors='coerce').dropna() 
 
 print(f"Time range: {iat.min():.6f} to {iat.max():.6f} s")
 print(f"Mean IAT: {iat.mean():.6f} s")
